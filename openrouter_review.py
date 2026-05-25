@@ -7,7 +7,7 @@ import sys
 import urllib.error
 import urllib.request
 
-FREE_MODEL = "deepseek/deepseek-r1:free"
+FREE_MODEL = "openrouter/free"
 PAID_MODEL = "deepseek/deepseek-v4-pro"
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 

@@ -1,116 +1,117 @@
 ---
 name: openrouter-review
-description: Review code or text using DeepSeek via OpenRouter (R1:free → V4 Pro fallback). Use as Codex alternative for review. After presenting findings, implements fixes directly with Edit/Write. Works with git diffs and/or text files (notes, docs, .md).
+description: Review code or text using OpenRouter (openrouter/free → DeepSeek V4 Pro fallback). Use as Codex alternative for review. After presenting findings, can implement fixes directly with Edit/Write. Works with git diffs and/or text files (notes, docs, .md).
 ---
 
-## When to use this skill
-- When Codex is unavailable or credits are exhausted
-- As a standalone code or text reviewer (notes, drafts, specs)
-- For a second opinion before making important changes
+## Cuándo usar este skill
+- Cuando Codex no está disponible o sus créditos se agotaron
+- Como revisor standalone de código o texto (notas, drafts, specs)
+- Para obtener una segunda opinión antes de hacer cambios importantes
 
-## Steps
+## Pasos
 
-### 1. Verify API key
+### 1. Verificar API key
 
-Run:
+Correr:
 ```bash
 echo $OPENROUTER_API_KEY
 ```
 
-If empty, tell the user:
-> "Missing `OPENROUTER_API_KEY`. Add it to `~/.claude/settings.json` under `env`, or set it with: `export OPENROUTER_API_KEY='your-key'`"
-Stop execution.
+Si la salida está vacía, decirle al usuario:
+> "Falta `OPENROUTER_API_KEY`. Debería estar en settings.json — reinicia Claude Code o configúrala con: `$env:OPENROUTER_API_KEY = 'tu-key'`"
+Y detener la ejecución.
 
-### 2. Select model
+### 2. Seleccionar modelo
 
-Ask the user with AskUserQuestion:
-- **Free — DeepSeek R1:free** — no cost, reasoning model. May hit rate limits.
-- **Paid — DeepSeek V4 Pro** — ~$0.44/M tokens, more capable, no rate limits.
-- **Auto (Recommended)** — tries free first; falls back to paid automatically if it fails.
+Preguntar al usuario con AskUserQuestion:
+- **Gratis — openrouter/free** — sin costo, elige automáticamente el mejor modelo gratuito disponible. Puede tener rate limits.
+- **Pagado — DeepSeek V4 Pro** — $0.44/M tokens, más capaz y sin límites de tasa.
+- **Auto** — intenta gratis primero; si falla, usa pagado automáticamente. (Recomendado)
 
-Map the answer to `--model free|paid|auto` for the script.
+Mapear la respuesta a `--model free|paid|auto` para el script.
 
-### 3. Verify script exists
+### 3. Verificar que el script existe
 
-Check that `$HOME/.claude/scripts/openrouter_review.py` exists.
-If not, tell the user to follow the installation instructions.
+Verificar que existe `C:\Users\chido\.claude\scripts\openrouter_review.py`.
+Si no existe, decirle al usuario que reinstale el skill.
 
-### 4. Collect input
+### 4. Recopilar input
 
-Run in parallel:
+Ejecutar en paralelo:
 ```bash
 git diff HEAD 2>/dev/null || true
 git diff --cached 2>/dev/null || true
 ```
 
-Also read any files the user specified when invoking the skill.
+Leer también cualquier archivo que el usuario haya especificado al invocar el skill.
 
-If there is no diff and no files specified, ask:
-> "What do you want to review? Specify files or paste content."
-Wait for a response before continuing.
+Si no hay diff ni archivos especificados, preguntar:
+> "¿Qué quieres revisar? Especifica archivos o pega el contenido."
+Y esperar respuesta antes de continuar.
 
-### 5. Build the prompt
+### 5. Construir el prompt
 
-Write the following to `$HOME/.claude/scripts/.or_review_prompt.txt`:
+Escribir el siguiente contenido a `$HOME/.claude/scripts/.or_review_prompt.txt`
+(ruta fija que funciona en bash y PowerShell):
 
 ```
-=== CONTENT FOR REVIEW ===
+=== CONTEXTO PARA REVIEW ===
 
-[Include only if there is a diff]
+[Incluir esta sección solo si hay diff]
 --- GIT DIFF ---
-<diff output>
+<contenido del diff>
 
-[Include only if files were specified]
---- FILES ---
-<filename>:
-<file content>
+[Incluir esta sección solo si hay archivos especificados]
+--- ARCHIVOS ---
+<nombre de archivo>:
+<contenido del archivo>
 
-Review the content above. Report bugs, security issues, and improvements. Number each finding.
+Revisa el contenido anterior. Reporta bugs, problemas de seguridad y mejoras. Numera cada finding.
 ```
 
-### 6. Run the script
+### 6. Ejecutar el script
 
-Detect Python dynamically:
+Detectar Python dinámicamente:
 ```bash
 PYTHON_BIN=$(command -v python 2>/dev/null || command -v python3 2>/dev/null || echo "$HOME/AppData/Local/Programs/Python/Python312/python.exe")
 ```
 
-Then run:
+Luego ejecutar:
 ```bash
 "$PYTHON_BIN" "$HOME/.claude/scripts/openrouter_review.py" \
   --prompt-file "$HOME/.claude/scripts/.or_review_prompt.txt" \
   --mode review \
-  --model <free|paid|auto from step 2>
+  --model <free|paid|auto según paso 2>
 ```
 
-If a fallback message appears in stderr (line starting with `[openrouter-review]`), show it to the user before presenting findings.
+Si aparece un mensaje de fallback en stderr (línea que empieza con `[openrouter-review]`), mostrárselo al usuario antes de presentar los findings.
 
-### 7. Present findings
+### 7. Presentar findings
 
-Structure DeepSeek's response into clear sections.
+Estructurar la respuesta de DeepSeek en secciones claras.
 
-For **code**:
-- **Bugs / logic errors** (numbered findings)
-- **Security** (numbered findings)
-- **Improvements** (numbered findings)
+Para **código**:
+- **Bugs / errores lógicos** (findings numerados)
+- **Seguridad** (findings numerados)
+- **Mejoras** (findings numerados)
 
-For **text or notes** (.md, .txt, documents):
-- **Clarity** (numbered findings)
-- **Consistency** (numbered findings)
-- **Weak arguments** (numbered findings)
+Para **texto o notas** (.md, .txt, documentos):
+- **Claridad** (findings numerados)
+- **Consistencia** (findings numerados)
+- **Argumentos débiles** (findings numerados)
 
-If DeepSeek's response is already numbered and structured, present it as-is without reformatting.
+Si la respuesta de DeepSeek ya viene numerada y estructurada, presentarla tal cual sin reformatear.
 
-### 8. Offer implementation
+### 8. Ofrecer implementación
 
-Ask the user:
-> "Do you want me to implement any fix? Specify numbers (e.g. `1, 3`) or say `all` / `none`."
+Preguntar al usuario:
+> "¿Quieres que implemente algún fix? Indica los números (ej. `1, 3`) o di `todos` / `ninguno`."
 
-### 9. Apply fixes directly
+### 9. Aplicar fixes directamente
 
-For each confirmed fix, read the affected file and apply the change using Edit or Write.
+Para cada fix confirmado, leer el archivo afectado y aplicar el cambio usando Edit o Write.
 
-Apply **independent fixes in parallel** (multiple Edit calls in one message).
-Apply dependent fixes sequentially.
+Aplicar fixes **independientes en paralelo** (múltiples Edit en el mismo mensaje).
+Fixes que dependen unos de otros aplicarlos en secuencia.
 
-Report to the user what changed and what remains pending.
+Después de aplicar, reportar al usuario qué cambió y qué quedó pendiente.
