@@ -32,26 +32,58 @@ def test_missing_api_key():
 
 
 # --- Logica PURA del auto-refresco (2026-06-19): sin red ni disco --------------
-def test_rank_prefiere_familias_de_codigo_y_filtra_contexto_bajo():
+def test_rank_codigo_primero_excluye_densos_y_hunde_modelitos():
     catalog = {"data": [
-        {"id": "qwen/qwen3-coder:free", "context_length": 1000000,
+        {"id": "qwen/qwen3-coder:free", "name": "Qwen3 Coder 480B A35B",
+         "context_length": 1000000, "pricing": {"prompt": "0", "completion": "0"}},
+        {"id": "nvidia/nemotron-3-super-120b-a12b:free", "name": "Nemotron 3 Super 120B A12B",
+         "context_length": 1000000, "pricing": {"prompt": "0", "completion": "0"}},
+        {"id": "nousresearch/hermes-3-llama-3.1-405b:free", "name": "Hermes 3 405B",
+         "context_length": 131000, "pricing": {"prompt": "0", "completion": "0"}},
+        {"id": "openai/gpt-oss-20b:free", "name": "gpt-oss-20b",
+         "context_length": 131000, "pricing": {"prompt": "0", "completion": "0"}},
+        {"id": "some/tiny-1b:free", "name": "Tiny 1B", "context_length": 8000,
          "pricing": {"prompt": "0", "completion": "0"}},
-        {"id": "some/tiny-model:free", "context_length": 8000,
-         "pricing": {"prompt": "0", "completion": "0"}},
-        {"id": "meta-llama/llama-3.3-70b-instruct:free", "context_length": 131000,
-         "pricing": {"prompt": "0", "completion": "0"}},
-        {"id": "openai/gpt-4o", "context_length": 128000,
+        {"id": "openai/gpt-4o", "name": "GPT-4o", "context_length": 128000,
          "pricing": {"prompt": "5", "completion": "15"}},
-        {"id": "x/zero-priced-generic", "context_length": 64000,
-         "pricing": {"prompt": "0", "completion": "0"}},
+        {"id": "x/zero-priced-generic-200b", "name": "Generic 200B",
+         "context_length": 64000, "pricing": {"prompt": "0", "completion": "0"}},
+        {"id": "nvidia/nemotron-3.5-content-safety:free", "name": "Nemotron Content Safety 4B",
+         "context_length": 128000, "pricing": {"prompt": "0", "completion": "0"}},
     ]}
     out = orr.rank_free_models(catalog)
-    assert "openai/gpt-4o" not in out            # de pago: excluido
-    assert "some/tiny-model:free" not in out     # contexto < 32K: excluido
-    assert out[0] == "qwen/qwen3-coder:free"     # familia 'coder' va primero
-    assert "meta-llama/llama-3.3-70b-instruct:free" in out
-    assert "x/zero-priced-generic" in out        # pricing 0 = gratis aunque no sea :free
-    print("PASS: test_rank_prefiere_familias_de_codigo_y_filtra_contexto_bajo")
+    assert "openai/gpt-4o" not in out                   # de pago: excluido
+    assert "some/tiny-1b:free" not in out               # contexto < 32K: excluido
+    assert "x/zero-priced-generic-200b" not in out      # familia desconocida: no es revisor
+    assert "nvidia/nemotron-3.5-content-safety:free" not in out  # marcador de exclusion
+    assert "nousresearch/hermes-3-llama-3.1-405b:free" not in out  # denso gigante (405B): lento
+    # especialista de codigo primero
+    assert out[0] == "qwen/qwen3-coder:free"
+    # el modelito (gpt-oss-20B) va DESPUES de un modelo serio (nemotron-super 120B)
+    assert (out.index("nvidia/nemotron-3-super-120b-a12b:free")
+            < out.index("openai/gpt-oss-20b:free"))
+    print("PASS: test_rank_codigo_primero_excluye_densos_y_hunde_modelitos")
+
+
+def test_params_b_ignora_activos():
+    # _params_b debe leer el TOTAL (550), no los activos (55) de 'a55b'.
+    assert orr._params_b({"id": "nvidia/nemotron-3-ultra-550b-a55b:free"}) == 550.0
+    # un modelo que SOLO declara activos no infla su total con ese numero.
+    assert orr._params_b({"id": "x/raro-a55b:free"}) == 0.0
+    # _active_b si captura los activos.
+    assert orr._active_b({"id": "nvidia/nemotron-3-ultra-550b-a55b:free"}) == 55.0
+    assert orr._active_b({"id": "meta-llama/llama-3.3-70b-instruct:free"}) is None
+    print("PASS: test_params_b_ignora_activos")
+
+
+def test_quarantine_vigente_vs_expirada():
+    ahora = 1_000_000.0
+    q = {"a/malo:free": ahora + 3600, "b/viejo:free": ahora - 10, "c/basura:free": "nope"}
+    assert orr._is_quarantined("a/malo:free", q, now=ahora) is True     # cooldown vigente
+    assert orr._is_quarantined("b/viejo:free", q, now=ahora) is False   # ya expiro
+    assert orr._is_quarantined("c/basura:free", q, now=ahora) is False  # valor corrupto
+    assert orr._is_quarantined("d/no-listado:free", q, now=ahora) is False
+    print("PASS: test_quarantine_vigente_vs_expirada")
 
 
 def test_rank_respeta_tope_max_ladder():

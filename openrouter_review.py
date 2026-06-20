@@ -24,13 +24,16 @@ import time
 import urllib.error
 import urllib.request
 
-# Verificado contra https://openrouter.ai/api/v1/models el 2026-06-10.
+# Verificado contra https://openrouter.ai/api/v1/models el 2026-06-19.
 # Si un modelo desaparece del catalogo, la escalera salta al siguiente.
+# Orden: especialista de codigo y MoE agiles primero (en MoE manda la velocidad los params
+# ACTIVOS, no el total); densos lentos abajo o fuera.
 FREE_MODELS = [
-    "qwen/qwen3-coder:free",                    # 1M ctx, especialista en codigo
-    "openai/gpt-oss-120b:free",                 # 131K ctx
-    "nvidia/nemotron-3-super-120b-a12b:free",   # 1M ctx
-    "meta-llama/llama-3.3-70b-instruct:free",   # 131K ctx
+    "qwen/qwen3-coder:free",                    # 480B MoE (35B act): especialista codigo, agil
+    "openai/gpt-oss-120b:free",                 # 120B MoE (~5B act): alto razonamiento, agil
+    "nvidia/nemotron-3-super-120b-a12b:free",   # 120B MoE (12B act)
+    "nvidia/nemotron-3-ultra-550b-a55b:free",   # 550B MoE (55B act): refuerzo pesado
+    "meta-llama/llama-3.3-70b-instruct:free",   # 70B denso
 ]
 PAID_MODELS = [
     "deepseek/deepseek-v4-flash",   # $0.098/M in, $0.197/M out (2026-06-10), 1M ctx
@@ -50,13 +53,29 @@ MODELS_URL = "https://openrouter.ai/api/v1/models"
 CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "openrouter_models_cache.json")
 CACHE_TTL_SECONDS = 7 * 24 * 3600
+# Cuarentena: un modelo que se porta mal (JSON basura, HTTP 4xx) se saca de la escalera por
+# un cooldown y se registra en el log. Se reintenta solo cuando expira (auto-sanacion). Los
+# 429 (rate limit) NO mandan a cuarentena: el modelo esta bien, solo lleno hoy.
+QUARANTINE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "openrouter_quarantine.json")
+QUARANTINE_COOLDOWN_SECONDS = 24 * 3600
+LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "openrouter_review.log")
 MIN_CONTEXT = 32000          # un revisor con < 32K de contexto no sirve para diffs reales
-MAX_FREE_LADDER = 6          # cuantos modelos gratis conservar en la escalera
+MAX_FREE_LADDER = 10         # cuantos modelos gratis conservar en la escalera
 RETRY_AFTER_MAX = 30         # si el 429 pide esperar mas que esto, saltar de modelo
-# Familias conocidas-buenas-para-codigo, en orden de preferencia. El ranking se hace
-# por (familia preferida, mayor contexto) — sin un LLM evaluando "para que sirve cada uno".
+SMALL_PARAMS_B = 50          # < esto = "modelito": va al fondo, no compite con los grandes
+DENSE_SLOW_B = 150           # un modelo DENSO (sin params activos declarados) >= esto es muy
+                             # lento en el tier gratis y se excluye (ej. hermes-405B denso)
+# Familias conocidas-buenas-para-codigo (porton: solo estas entran a la escalera). El orden
+# prioriza al especialista de codigo y a los modelos agiles; la familia ya ordena
+# coder > gpt-oss > nemotron > ... Sin un LLM evaluando "para que sirve cada uno".
 PREFERRED_FAMILIES = ["coder", "deepseek", "gpt-oss", "nemotron", "qwen3", "qwen",
                       "llama", "mistral", "gemma"]
+# Modelos que pasan el filtro de familia por coincidencia de substring pero NO son
+# revisores de codigo (moderacion, vision-only, audio/musica, embeddings): se excluyen.
+EXCLUDE_MARKERS = ["content-safety", "guardrail", "moderation", "uncensored", "venice",
+                   "lyria", "whisper", "embed", "rerank", "-tts", "-vl", "-omni"]
 
 JSON_RULES = (
     'Responde UNICAMENTE con JSON valido (sin markdown, sin texto fuera del JSON) con esta forma: '
@@ -134,12 +153,37 @@ def _http_get_json(url, api_key, timeout=30):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def rank_free_models(catalog):
-    """Del catalogo de /api/v1/models, los ids GRATIS utiles, ordenados. Funcion PURA
-    (no toca red): recibe el dict ya parseado y aplica la heuristica.
+def _params_b(model):
+    """Params TOTALES en miles de millones, inferidos del id y el name (ej. '...-550b-a55b'
+    -> 550, 'Qwen3 Coder 480B' -> 480). El \\b inicial evita capturar los params ACTIVOS
+    ('a55b': la 'a' pega al numero, no hay frontera de palabra, asi que '55b' NO matchea).
+    Toma el mayor de los totales. 0.0 si no se detecta. Sin red ni LLM: puro parseo."""
+    text = ((model.get("id") or "") + " " + (model.get("name") or "")).lower()
+    return max((float(n) for n in re.findall(r"\b(\d+(?:\.\d+)?)\s*b\b", text)), default=0.0)
 
-    Gratis = id termina en ':free' o pricing prompt+completion == 0. Filtra por contexto
-    minimo y ordena por (familia preferida, mayor contexto). Tope MAX_FREE_LADDER."""
+
+def _active_b(model):
+    """Params ACTIVOS declarados (patron 'aNNb', ej. 'a35b' -> 35) en id/name; None si no
+    los declara. En un MoE los activos mandan la velocidad; un modelo sin 'aNNb' se trata
+    como DENSO (enciende todos sus params -> lento si es grande)."""
+    text = ((model.get("id") or "") + " " + (model.get("name") or "")).lower()
+    vals = [float(n) for n in re.findall(r"a(\d+(?:\.\d+)?)\s*b\b", text)]
+    return max(vals) if vals else None
+
+
+def rank_free_models(catalog):
+    """Del catalogo de /api/v1/models, los ids GRATIS utiles para revisar codigo, ordenados.
+    Funcion PURA (no toca red): recibe el dict ya parseado y aplica la heuristica.
+
+    Orden buscado: especialista de codigo y modelos agiles primero; modelitos al fondo;
+    gigantes DENSOS (lentos) fuera. Concretamente:
+      - Gratis (id ':free' o pricing prompt+completion == 0) con contexto >= MIN_CONTEXT.
+      - Excluye no-revisores (EXCLUDE_MARKERS) y familias desconocidas.
+      - Excluye densos gigantes: sin 'aNNb' declarado y total >= DENSE_SLOW_B (ej. hermes-405B
+        denso, que enciende sus 405B completos -> lentisimo en el tier gratis).
+      - Ordena por (modelo serio antes que modelito, familia preferida, mayor tamano, mayor
+        contexto). El porton de familia ya prioriza coder > gpt-oss > nemotron > ...
+      Tope MAX_FREE_LADDER."""
     data = catalog.get("data") if isinstance(catalog, dict) else None
     if not isinstance(data, list):
         return []
@@ -148,6 +192,8 @@ def rank_free_models(catalog):
         if not isinstance(m, dict):
             continue
         mid = m.get("id") or ""
+        low = mid.lower()
+        full = (mid + " " + (m.get("name") or "")).lower()
         pricing = m.get("pricing") or {}
         es_gratis = mid.endswith(":free") or (
             _is_zero(pricing.get("prompt")) and _is_zero(pricing.get("completion")))
@@ -159,12 +205,18 @@ def rank_free_models(catalog):
             ctx = 0
         if ctx < MIN_CONTEXT:
             continue
-        low = mid.lower()
-        rank = next((i for i, fam in enumerate(PREFERRED_FAMILIES) if fam in low),
-                    len(PREFERRED_FAMILIES))
-        cands.append((rank, -ctx, mid))
+        if any(marker in full for marker in EXCLUDE_MARKERS):
+            continue
+        rank = next((i for i, fam in enumerate(PREFERRED_FAMILIES) if fam in low), None)
+        if rank is None:        # familia desconocida: no es un revisor de codigo confiable
+            continue
+        total = _params_b(m)
+        if _active_b(m) is None and total >= DENSE_SLOW_B:
+            continue            # gigante denso: demasiado lento para el tier gratis
+        size_tier = 0 if total >= SMALL_PARAMS_B else 1   # modelitos al fondo de la escalera
+        cands.append((size_tier, rank, -total, -ctx, mid))
     cands.sort()
-    return [mid for _r, _c, mid in cands[:MAX_FREE_LADDER]]
+    return [mid for _t, _r, _c, _x, mid in cands[:MAX_FREE_LADDER]]
 
 
 def load_free_models(api_key):
@@ -193,6 +245,54 @@ def load_free_models(api_key):
         log(f"no se pudo escribir el cache de modelos ({exc})")
     log(f"escalera gratis refrescada: {', '.join(models)}")
     return models
+
+
+# --- Cuarentena de modelos que se portan mal (2026-06-19) ---------------------
+# Si un modelo escupe JSON basura o devuelve HTTP 4xx (esta roto, no solo saturado),
+# se saca de la escalera por un cooldown y se anota en el log. Al expirar, se reintenta.
+def _load_quarantine():
+    """Dict {model_id: until_epoch} de modelos en cuarentena. {} si no hay archivo o
+    esta corrupto (nunca revienta: una cuarentena perdida solo reintenta un modelo malo)."""
+    try:
+        with open(QUARANTINE_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _is_quarantined(model, quarantine, now=None):
+    """True si el modelo tiene una cuarentena vigente (su cooldown aun no expira)."""
+    until = quarantine.get(model)
+    if not isinstance(until, (int, float)):
+        return False
+    return (now if now is not None else time.time()) < until
+
+
+def _append_log(line):
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError as exc:
+        log(f"no se pudo escribir el log ({exc})")
+
+
+def quarantine_model(model, reason):
+    """Saca un modelo de la escalera por QUARANTINE_COOLDOWN_SECONDS y registra el motivo.
+    Escritura atomica (tmp + os.replace): el JSON nunca queda a medias si dos procesos
+    coinciden (en el peor caso se pierde una entrada, no se corrompe el archivo)."""
+    until = time.time() + QUARANTINE_COOLDOWN_SECONDS
+    data = _load_quarantine()
+    data[model] = until
+    try:
+        tmp = QUARANTINE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(tmp, QUARANTINE_PATH)
+    except OSError as exc:
+        log(f"no se pudo escribir la cuarentena ({exc})")
+    _append_log(f"{time.ctime()}  CUARENTENA  {model}  ({reason})  hasta {time.ctime(until)}")
+    log(f"modelo en cuarentena {QUARANTINE_COOLDOWN_SECONDS // 3600}h: {model} ({reason})")
 
 
 def retry_after_seconds(exc):
@@ -230,6 +330,10 @@ def try_ladder(prompt, models, mode, api_key, exclude):
                 if exc.code in (408, 500, 502, 503, 504) and attempt < RETRIES_PER_MODEL:
                     time.sleep(BACKOFF_SECONDS * attempt)  # transitorio: backoff y reintenta
                     continue
+                if 400 <= exc.code < 500 and exc.code != 429:
+                    # 4xx (400/404/422...) = el modelo rechaza o ya no existe: esta roto,
+                    # no solo saturado. A cuarentena. (429 es rate limit: NO se castiga.)
+                    quarantine_model(model, f"HTTP {exc.code} {exc.reason}")
                 break  # no retryable o agotado: siguiente modelo
             except Exception as exc:
                 log(f"{model}: {exc} (intento {attempt}/{RETRIES_PER_MODEL})")
@@ -308,6 +412,7 @@ def get_verified_review(prompt, models, mode, api_key, exclude=frozenset()):
                 log(f"{model}: reintento correctivo fallo: {exc}")
             if findings is None:
                 log(f"{model}: descartado (no produce JSON); siguiente modelo")
+                quarantine_model(model, "no produce JSON valido (ni tras reintento correctivo)")
                 tried.add(model)
                 continue
         ok, discarded = verify_quotes(findings, prompt)
@@ -400,6 +505,13 @@ def main():
     # Escalera gratis fresca (cache semanal). En modo 'paid' no hace falta tocar el
     # catalogo, asi que se evita la llamada de red.
     free_models = FREE_MODELS if args.model == "paid" else load_free_models(api_key)
+    # Saca de la escalera los modelos en cuarentena vigente (fallaron feo hace poco).
+    quarantine = _load_quarantine()
+    vigentes = [m for m in free_models if not _is_quarantined(m, quarantine)]
+    if len(vigentes) < len(free_models):
+        fuera = [m for m in free_models if m not in vigentes]
+        log(f"en cuarentena (omitidos de la escalera): {', '.join(fuera)}")
+    free_models = vigentes or free_models  # si TODO quedo en cuarentena, intentarlos igual
     ladders = {
         "free": free_models,
         "paid": PAID_MODELS,

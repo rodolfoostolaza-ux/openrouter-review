@@ -10,7 +10,7 @@ A Claude Code skill that reviews code and text through [OpenRouter](https://open
 
 ## How it picks models
 
-The free-model ladder is **not hardcoded**. On each run the script queries OpenRouter's `/api/v1/models` catalog, keeps the free models that are actually useful (filters by context window, ranks by code-friendly model family), and caches the result for a week. The hardcoded `FREE_MODELS` list is only a seed / safety net if the catalog query fails. No LLM is involved in the selection — it's a deterministic heuristic, zero extra tokens.
+The free-model ladder is **not hardcoded**. On each run the script queries OpenRouter's `/api/v1/models` catalog, keeps the free models that are actually useful (filters by context window and code-friendly model family), and caches the result for a week. Ordering is **code-specialist and agile-first**: `qwen3-coder` leads, then capable MoE models, with small models pushed to the back and slow dense giants (e.g. a dense 405B) excluded outright. The hardcoded `FREE_MODELS` list is only a seed / safety net if the catalog query fails. No LLM is involved in the selection — it's a deterministic heuristic, zero extra tokens.
 
 | Step | What runs | Cost |
 |------|-----------|------|
@@ -18,6 +18,8 @@ The free-model ladder is **not hardcoded**. On each run the script queries OpenR
 | Paid fallback | `deepseek/deepseek-v4-flash` (~$0.10/M in, $0.20/M out) | Cents per review |
 
 Rate limits (HTTP 429) are handled smartly: the script honors a short `Retry-After`, otherwise it jumps to the next model immediately instead of sleeping against a daily cap that won't clear.
+
+**Misbehaving models get quarantined.** If a model returns garbage (invalid JSON even after a corrective retry) or a hard HTTP 4xx, it's pulled from the ladder for a 24h cooldown and the event is appended to `openrouter_review.log`. A 429 does *not* quarantine — that's just a busy model, not a broken one. The quarantine self-heals when the cooldown expires.
 
 ## Modes
 

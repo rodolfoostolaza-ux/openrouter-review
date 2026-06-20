@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+openrouter_models_cache.json
+openrouter_quarantine.json
+openrouter_review.log
+.or_review_prompt.txt
