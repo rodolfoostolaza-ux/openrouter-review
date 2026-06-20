@@ -1,41 +1,58 @@
 ---
 name: openrouter-review
-description: Review code or text using OpenRouter (openrouter/free → DeepSeek V4 Pro fallback). Use as Codex alternative for review. After presenting findings, can implement fixes directly with Edit/Write. Works with git diffs and/or text files (notes, docs, .md).
+description: Review code or text using OpenRouter with verified free-model ladder, cheap-paid fallback, and anti-hallucination quote verification. Use as automatic fallback when codex:rescue fails, or as standalone reviewer. After presenting findings, can implement fixes directly with Edit/Write. Works with git diffs and/or text files (notes, docs, .md).
 ---
 
 ## Cuándo usar este skill
-- Cuando Codex no está disponible o sus créditos se agotaron
-- Como revisor standalone de código o texto (notas, drafts, specs)
-- Para obtener una segunda opinión antes de hacer cambios importantes
+- **Modo fallback (automático):** cuando `codex:rescue` falla, no responde o agota
+  créditos. Correr DE INMEDIATO, sin preguntar nada al usuario (ver "Modo fallback").
+- **Modo manual:** como revisor standalone de código o texto, o segunda opinión.
+
+## Cómo funciona el script (contexto)
+
+`~/.claude/scripts/openrouter_review.py` ya trae la robustez integrada — no hay
+que orquestarla desde el skill:
+- Escalera de modelos gratis AUTO-REFRESCADA desde /api/v1/models (cache semanal,
+  selección heurística por familia-de-código + contexto); `FREE_MODELS` hardcoded
+  queda como semilla y red de seguridad. Retry+backoff inteligente en 429/5xx:
+  respeta `Retry-After` si es corto, si no salta de modelo (los :free suelen tener
+  tope diario, esperar no los desatura).
+- Si todos los gratis fallan, cae solo al pagado más barato decente
+  (deepseek-v4-flash, ~$0.10/M in — un review típico cuesta centavos) y lo avisa
+  en stderr con `AVISO: se uso modelo PAGADO`.
+- Anti-alucinación: exige JSON con cita textual por finding y descarta
+  automáticamente todo finding cuya cita no exista en el input (lo reporta en stderr).
+- `--model consensus`: dos modelos distintos; findings `confirmado x2` vs
+  `1 modelo (baja confianza)`.
 
 ## Pasos
 
 ### 1. Verificar API key
 
-Correr:
 ```bash
 echo $OPENROUTER_API_KEY
 ```
 
-Si la salida está vacía, decirle al usuario:
-> "Falta `OPENROUTER_API_KEY`. Debería estar en settings.json — reinicia Claude Code o configúrala con: `$env:OPENROUTER_API_KEY = 'tu-key'`"
-Y detener la ejecución.
+Si está vacía: "Falta `OPENROUTER_API_KEY`. Debería estar en settings.json —
+reinicia Claude Code o configúrala con `$env:OPENROUTER_API_KEY = 'tu-key'`."
+Y detener.
 
-### 2. Seleccionar modelo
+### 2. Determinar el modo de invocación
 
-Preguntar al usuario con AskUserQuestion:
-- **Gratis — openrouter/free** — sin costo, elige automáticamente el mejor modelo gratuito disponible. Puede tener rate limits.
-- **Pagado — DeepSeek V4 Pro** — $0.44/M tokens, más capaz y sin límites de tasa.
-- **Auto** — intenta gratis primero; si falla, usa pagado automáticamente. (Recomendado)
+**Modo fallback** (vienes de un codex:rescue fallido o el flujo de code review
+te mandó aquí): NO preguntar nada. Usar `--model consensus` directo y saltar al paso 3.
 
-Mapear la respuesta a `--model free|paid|auto` para el script.
+**Modo manual** (el usuario invocó el skill directamente): preguntar con
+AskUserQuestion:
+- **Consensus — 2 modelos gratis (Recomendado)** — dos revisores independientes,
+  findings etiquetados por confianza. Gratis salvo que los gratis fallen.
+- **Auto — 1 modelo** — más rápido, escalera gratis con fallback a pagado barato.
+- **Free — solo gratis** — nunca paga; si todos dan 429, falla y reporta.
+- **Paid — directo al pagado** — deepseek-v4-flash (~$0.10/M in, $0.20/M out), sin esperas.
 
-### 3. Verificar que el script existe
+Mapear a `--model consensus|auto|free|paid`.
 
-Verificar que existe `C:\Users\chido\.claude\scripts\openrouter_review.py`.
-Si no existe, decirle al usuario que reinstale el skill.
-
-### 4. Recopilar input
+### 3. Recopilar input
 
 Ejecutar en paralelo:
 ```bash
@@ -43,75 +60,79 @@ git diff HEAD 2>/dev/null || true
 git diff --cached 2>/dev/null || true
 ```
 
-Leer también cualquier archivo que el usuario haya especificado al invocar el skill.
+Leer también cualquier archivo que el usuario (o el flujo de fallback) haya
+especificado. Si no hay diff ni archivos: preguntar "¿Qué quieres revisar?"
+y esperar (solo en modo manual; en fallback, usar los archivos que venían
+del intento de codex:rescue).
 
-Si no hay diff ni archivos especificados, preguntar:
-> "¿Qué quieres revisar? Especifica archivos o pega el contenido."
-Y esperar respuesta antes de continuar.
+### 4. Construir el prompt
 
-### 5. Construir el prompt
-
-Escribir el siguiente contenido a `$HOME/.claude/scripts/.or_review_prompt.txt`
-(ruta fija que funciona en bash y PowerShell):
+Escribir a `$HOME/.claude/scripts/.or_review_prompt.txt`:
 
 ```
 === CONTEXTO PARA REVIEW ===
 
-[Incluir esta sección solo si hay diff]
+[Solo si hay diff]
 --- GIT DIFF ---
 <contenido del diff>
 
-[Incluir esta sección solo si hay archivos especificados]
+[Solo si hay archivos]
 --- ARCHIVOS ---
 <nombre de archivo>:
 <contenido del archivo>
 
-Revisa el contenido anterior. Reporta bugs, problemas de seguridad y mejoras. Numera cada finding.
+[Si vienes de codex:rescue, incluir también los invariantes del dominio que
+se le habían pasado a codex]
+--- INVARIANTES DEL DOMINIO ---
+<invariantes>
 ```
 
-### 6. Ejecutar el script
+No hace falta añadir instrucciones de review al prompt — el system prompt del
+script ya las trae (incluido el formato JSON con citas).
 
-Detectar Python dinámicamente:
+### 5. Ejecutar el script
+
 ```bash
 PYTHON_BIN=$(command -v python 2>/dev/null || command -v python3 2>/dev/null || echo "$HOME/AppData/Local/Programs/Python/Python312/python.exe")
-```
-
-Luego ejecutar:
-```bash
 "$PYTHON_BIN" "$HOME/.claude/scripts/openrouter_review.py" \
   --prompt-file "$HOME/.claude/scripts/.or_review_prompt.txt" \
   --mode review \
-  --model <free|paid|auto según paso 2>
+  --model <según paso 2>
 ```
 
-Si aparece un mensaje de fallback en stderr (línea que empieza con `[openrouter-review]`), mostrárselo al usuario antes de presentar los findings.
+Leer stderr: ahí van los saltos de escalera, findings descartados por cita no
+verificable, y el aviso si se usó modelo pagado. Resumir eso al usuario en una
+línea (ej. "qwen dio 429, revisaron gpt-oss-120b y nemotron, 1 finding
+descartado por cita inventada, costo $0").
 
-### 7. Presentar findings
+### 6. Presentar findings
 
-Estructurar la respuesta de DeepSeek en secciones claras.
+El stdout ya viene estructurado (severidad, cita, problema, fix, confianza).
+Presentarlo tal cual o condensado. Reglas:
+- Findings `confirmado x2` → alta credibilidad.
+- Findings `baja confianza` → presentarlos como tales; verificar contra el
+  archivo real antes de actuar sobre ellos.
+- Si el script descartó findings (stderr), mencionarlo: es la señal de que el
+  filtro anti-alucinación está trabajando.
 
-Para **código**:
-- **Bugs / errores lógicos** (findings numerados)
-- **Seguridad** (findings numerados)
-- **Mejoras** (findings numerados)
+### 7. Aplicar fixes
 
-Para **texto o notas** (.md, .txt, documentos):
-- **Claridad** (findings numerados)
-- **Consistencia** (findings numerados)
-- **Argumentos débiles** (findings numerados)
+- **Severidad alta** (bug, seguridad, dato incorrecto) y `confirmado x2`:
+  aplicar autónomamente con Edit/Write (regla de CLAUDE.md global).
+- **Alta pero baja confianza:** verificar contra el archivo real; si se
+  confirma, aplicar; si no, descartar y decirlo.
+- **Media/baja:** listar y preguntar (en modo manual) o solo listar (en fallback).
 
-Si la respuesta de DeepSeek ya viene numerada y estructurada, presentarla tal cual sin reformatear.
+Fixes independientes en paralelo; dependientes en secuencia. Al final,
+reportar qué cambió y qué quedó pendiente.
 
-### 8. Ofrecer implementación
+## Mantenimiento
 
-Preguntar al usuario:
-> "¿Quieres que implemente algún fix? Indica los números (ej. `1, 3`) o di `todos` / `ninguno`."
+Desde 2026-06-19 la escalera GRATIS se auto-refresca: `load_free_models()` consulta
+`https://openrouter.ai/api/v1/models` y cachea una semana en
+`openrouter_models_cache.json` (junto al script). Ya NO hay que actualizar
+`FREE_MODELS` a mano — queda solo como semilla/fallback si la consulta falla. Para
+forzar un refresco antes de la semana: borrar ese cache.
 
-### 9. Aplicar fixes directamente
-
-Para cada fix confirmado, leer el archivo afectado y aplicar el cambio usando Edit o Write.
-
-Aplicar fixes **independientes en paralelo** (múltiples Edit en el mismo mensaje).
-Fixes que dependen unos de otros aplicarlos en secuencia.
-
-Después de aplicar, reportar al usuario qué cambió y qué quedó pendiente.
+`PAID_MODELS` sigue hardcoded (precios verificados 2026-06-10); revisar solo si el
+pagado de respaldo cambia de precio.
