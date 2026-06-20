@@ -58,7 +58,9 @@ CACHE_TTL_SECONDS = 7 * 24 * 3600
 # 429 (rate limit) NO mandan a cuarentena: el modelo esta bien, solo lleno hoy.
 QUARANTINE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "openrouter_quarantine.json")
-QUARANTINE_COOLDOWN_SECONDS = 24 * 3600
+QUARANTINE_COOLDOWN_SECONDS = 24 * 3600       # HTTP 4xx: modelo roto/dado de baja, fuera 1 dia
+QUARANTINE_SOFT_COOLDOWN_SECONDS = 2 * 3600   # JSON malo: suele ser transitorio (truncamiento
+                                              # por max_tokens, mala suerte), fuera solo un rato
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "openrouter_review.log")
 MIN_CONTEXT = 32000          # un revisor con < 32K de contexto no sirve para diffs reales
@@ -212,7 +214,10 @@ def rank_free_models(catalog):
             continue
         total = _params_b(m)
         if _active_b(m) is None and total >= DENSE_SLOW_B:
-            continue            # gigante denso: demasiado lento para el tier gratis
+            # gigante denso: demasiado lento para el tier gratis. Se avisa para que la
+            # exclusion sea visible (y no un buen modelo descartado en silencio).
+            log(f"excluido por denso gigante (lento): {mid} (~{total:.0f}B densos)")
+            continue
         size_tier = 0 if total >= SMALL_PARAMS_B else 1   # modelitos al fondo de la escalera
         cands.append((size_tier, rank, -total, -ctx, mid))
     cands.sort()
@@ -277,11 +282,13 @@ def _append_log(line):
         log(f"no se pudo escribir el log ({exc})")
 
 
-def quarantine_model(model, reason):
-    """Saca un modelo de la escalera por QUARANTINE_COOLDOWN_SECONDS y registra el motivo.
-    Escritura atomica (tmp + os.replace): el JSON nunca queda a medias si dos procesos
-    coinciden (en el peor caso se pierde una entrada, no se corrompe el archivo)."""
-    until = time.time() + QUARANTINE_COOLDOWN_SECONDS
+def quarantine_model(model, reason, cooldown=None):
+    """Saca un modelo de la escalera por `cooldown` segundos (default el largo, 24h) y registra
+    el motivo. Cooldown corto para fallas transitorias (JSON malo), largo para fallas duras
+    (HTTP 4xx). Escritura atomica (tmp + os.replace): el JSON nunca queda a medias si dos
+    procesos coinciden (en el peor caso se pierde una entrada, no se corrompe el archivo)."""
+    cooldown = QUARANTINE_COOLDOWN_SECONDS if cooldown is None else cooldown
+    until = time.time() + cooldown
     data = _load_quarantine()
     data[model] = until
     try:
@@ -292,7 +299,7 @@ def quarantine_model(model, reason):
     except OSError as exc:
         log(f"no se pudo escribir la cuarentena ({exc})")
     _append_log(f"{time.ctime()}  CUARENTENA  {model}  ({reason})  hasta {time.ctime(until)}")
-    log(f"modelo en cuarentena {QUARANTINE_COOLDOWN_SECONDS // 3600}h: {model} ({reason})")
+    log(f"modelo en cuarentena {cooldown // 3600}h: {model} ({reason})")
 
 
 def retry_after_seconds(exc):
@@ -412,7 +419,10 @@ def get_verified_review(prompt, models, mode, api_key, exclude=frozenset()):
                 log(f"{model}: reintento correctivo fallo: {exc}")
             if findings is None:
                 log(f"{model}: descartado (no produce JSON); siguiente modelo")
-                quarantine_model(model, "no produce JSON valido (ni tras reintento correctivo)")
+                # Cooldown CORTO: el JSON malo suele ser transitorio (truncamiento por
+                # max_tokens, mala suerte), no un modelo roto. No bancarlo 24h por un tropiezo.
+                quarantine_model(model, "no produce JSON valido (ni tras reintento correctivo)",
+                                 cooldown=QUARANTINE_SOFT_COOLDOWN_SECONDS)
                 tried.add(model)
                 continue
         ok, discarded = verify_quotes(findings, prompt)

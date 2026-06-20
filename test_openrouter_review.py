@@ -86,6 +86,26 @@ def test_quarantine_vigente_vs_expirada():
     print("PASS: test_quarantine_vigente_vs_expirada")
 
 
+def test_quarantine_cooldown_diferenciado():
+    import shutil
+    import time as _time
+    d = tempfile.mkdtemp()
+    orig_q, orig_l = orr.QUARANTINE_PATH, orr.LOG_PATH
+    try:
+        orr.QUARANTINE_PATH = os.path.join(d, "q.json")
+        orr.LOG_PATH = os.path.join(d, "q.log")
+        antes = _time.time()
+        orr.quarantine_model("x/soft:free", "json malo", cooldown=orr.QUARANTINE_SOFT_COOLDOWN_SECONDS)
+        orr.quarantine_model("y/hard:free", "http 404")   # default = cooldown largo (24h)
+        q = orr._load_quarantine()
+        assert 1.5 * 3600 < q["x/soft:free"] - antes < 2.5 * 3600   # ~2h, transitorio
+        assert 23 * 3600 < q["y/hard:free"] - antes < 25 * 3600     # ~24h, modelo roto
+        print("PASS: test_quarantine_cooldown_diferenciado")
+    finally:
+        orr.QUARANTINE_PATH, orr.LOG_PATH = orig_q, orig_l
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_rank_respeta_tope_max_ladder():
     data = [{"id": f"qwen/model-{i}:free", "context_length": 100000 + i,
              "pricing": {"prompt": "0", "completion": "0"}} for i in range(20)]
