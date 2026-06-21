@@ -439,6 +439,16 @@ def same_finding(a, b):
     return bool(la) and la == lb
 
 
+def model_family(model_id):
+    """Familia del modelo para diversificar el consenso: el proveedor (segmento antes del
+    '/'), en minusculas. gpt-oss-120b y gpt-oss-20b comparten proveedor 'openai' (el mismo
+    modelo en grande y mini -> mismos puntos ciegos); qwen3-coder y qwen3-235b comparten
+    'qwen' (misma base Qwen3). NO se usa PREFERRED_FAMILIES: ahi 'coder' es transversal y
+    separaria qwen3-coder de qwen3-235b siendo la misma base. Un consenso real exige DOS
+    familias distintas para que, cuando uno alucine, el otro lo cache de verdad."""
+    return model_id.split("/", 1)[0].strip().lower()
+
+
 def merge_consensus(fa, fb):
     merged, used_b = [], set()
     for a in fa:
@@ -542,7 +552,16 @@ def main():
         print(render(f1, [model1], d1))
         return
 
-    r2 = get_verified_review(prompt, ladder, args.mode, api_key, exclude={model1})
+    # Consenso REAL = dos FAMILIAS distintas. gpt-oss-120b y gpt-oss-20b son el mismo modelo
+    # en grande y mini (mismos puntos ciegos): juntarlos da un consenso falso. Se excluye
+    # TODA la familia del primer revisor, no solo el id puntual, para forzar otra familia.
+    fam1 = model_family(model1)
+    misma_familia = {m for m in ladder if model_family(m) == fam1}
+    if len(misma_familia) > 1:
+        otros = ", ".join(sorted(misma_familia - {model1}))
+        log(f"consenso: excluyo la familia '{fam1}' del 2do revisor ({otros}) "
+            "para no repetir puntos ciegos")
+    r2 = get_verified_review(prompt, ladder, args.mode, api_key, exclude=misma_familia)
     if r2 is None:
         log("Solo un modelo respondio; consenso degradado a revision simple.")
         for f in f1:
