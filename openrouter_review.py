@@ -337,9 +337,10 @@ def try_ladder(prompt, models, mode, api_key, exclude):
                 if exc.code in (408, 500, 502, 503, 504) and attempt < RETRIES_PER_MODEL:
                     time.sleep(BACKOFF_SECONDS * attempt)  # transitorio: backoff y reintenta
                     continue
-                if 400 <= exc.code < 500 and exc.code != 429:
+                if 400 <= exc.code < 500 and exc.code not in (408, 429):
                     # 4xx (400/404/422...) = el modelo rechaza o ya no existe: esta roto,
-                    # no solo saturado. A cuarentena. (429 es rate limit: NO se castiga.)
+                    # no solo saturado. A cuarentena. (429 rate limit y 408 timeout de red
+                    # NO se castigan: no son culpa del modelo.)
                     quarantine_model(model, f"HTTP {exc.code} {exc.reason}")
                 break  # no retryable o agotado: siguiente modelo
             except Exception as exc:
