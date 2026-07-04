@@ -44,6 +44,24 @@ RETRIES_PER_MODEL = 2
 BACKOFF_SECONDS = 8
 MIN_QUOTE_LEN = 8  # citas mas cortas no identifican nada y "verifican" por accidente
 
+# --- Proveedores con cuota DEDICADA (2026-07-04) ------------------------------
+# Los :free de OpenRouter son una alberca COMPARTIDA con todo el planeta: en horas pico
+# dan 429 sin importar tu saldo. La solucion no es reordenar esa alberca sino anteponerle
+# proveedores con cuota TUYA. Verificados como revisores 2026-07-04 (5/5 bugs sembrados,
+# 0 falsos positivos, respetan foco en test adversarial): gemma-4-31b ~0.7s, gemini-flash
+# ~8s. Un modelo con prefijo 'cerebras:'/'gemini:' va a su endpoint; sin prefijo = OpenRouter.
+CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
+GEMINI_URL_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+# Escalera: primero cuota dedicada rapida (gemma), luego gemini, luego la alberca :free de
+# OpenRouter, y al final el pagado barato (PAID_MODELS). Orden pedido por Rodolfo 2026-07-04.
+DEDICATED_FREE = ["cerebras:gemma-4-31b", "gemini:gemini-flash-latest"]
+# RPM: intervalo minimo entre llamadas al MISMO proveedor gratis, respetado ENTRE
+# invocaciones via archivo de estado. Cerebras free = 5 req/min -> 12s; Gemini flash free
+# ~15 rpm -> 4.5s con margen. "No me cobren" (Rodolfo): quedarse dentro del free tier.
+PROVIDER_MIN_INTERVAL = {"cerebras": 12.0, "gemini": 4.5}
+RATELIMIT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "openrouter_ratelimit.json")
+
 # --- Auto-refresco de la escalera GRATIS (2026-06-19) -------------------------
 # El catalogo de OpenRouter cambia: los :free aparecen y desaparecen (la v1 murio
 # porque deepseek-r1:free se borro). En vez de confiar solo en FREE_MODELS clavado
@@ -109,7 +127,71 @@ def log(msg):
     print(f"[openrouter-review] {msg}", file=sys.stderr)
 
 
-def call_model(prompt, model, mode, api_key):
+def resolve_provider(model_id):
+    """(provider, api_id, key_env) de un id de la escalera. Prefijo 'cerebras:'/'gemini:'
+    -> ese proveedor con su api_id limpio; sin prefijo = OpenRouter (comportamiento
+    historico intacto). No toca red: puro parseo del id."""
+    if model_id.startswith("cerebras:"):
+        return "cerebras", model_id.split(":", 1)[1], "CEREBRAS_API_KEY"
+    if model_id.startswith("gemini:"):
+        return "gemini", model_id.split(":", 1)[1], "GEMINI_API_KEY"
+    return "openrouter", model_id, "OPENROUTER_API_KEY"
+
+
+def _throttle(provider):
+    """Respeta el RPM del proveedor ENTRE invocaciones: si su ultima llamada fue hace menos
+    que PROVIDER_MIN_INTERVAL, duerme la diferencia. Estado compartido en archivo (escritura
+    atomica). OpenRouter no throttlea (cuenta pagada holgada; su 429 se maneja saltando de
+    modelo). Ante archivo corrupto: no espera (en el peor caso, una llamada de mas).
+
+    BEST-EFFORT, no atomico entre procesos concurrentes: el ciclo leer->calcular->escribir no
+    esta bloqueado, asi que dos reviews en paralelo pueden no espaciarse esa ronda. Suficiente
+    para uso secuencial (el caso real); en Developer tier de Cerebras el peor caso es micro-costo,
+    no baneo, y un 429 del free tier se maneja saltando de modelo. Si algun dia se corren muchos
+    reviews en paralelo, hara falta un file lock (fcntl/msvcrt) — hoy seria sobre-ingenieria."""
+    interval = PROVIDER_MIN_INTERVAL.get(provider)
+    if not interval:
+        return
+    try:
+        with open(RATELIMIT_PATH, encoding="utf-8") as fh:
+            state = json.load(fh)
+        state = state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        state = {}
+    last = state.get(provider, 0)
+    wait = interval - (time.time() - last) if isinstance(last, (int, float)) else 0
+    if wait > 0:
+        log(f"throttle {provider}: espero {wait:.1f}s para respetar su RPM")
+        time.sleep(wait)
+    state[provider] = time.time()
+    try:
+        tmp = RATELIMIT_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+        os.replace(tmp, RATELIMIT_PATH)
+    except OSError as exc:
+        log(f"no se pudo escribir el estado de rate-limit ({exc})")
+
+
+def call_model(prompt, model, mode):
+    """Despacha la llamada al proveedor que corresponda al id del modelo. La key se lee del
+    entorno (nunca se hardcodea: este script es publico). Respeta el RPM del proveedor."""
+    provider, api_id, key_env = resolve_provider(model)
+    key = os.environ.get(key_env)
+    if not key:
+        raise RuntimeError(f"falta {key_env} en el entorno para {model}")
+    _throttle(provider)
+    if provider == "gemini":
+        return _call_gemini(prompt, api_id, mode, key)
+    url = CEREBRAS_URL if provider == "cerebras" else API_URL
+    # Cerebras esta detras de Cloudflare y banea el User-Agent de urllib con 403 code 1010.
+    extra = {"User-Agent": "Mozilla/5.0"} if provider == "cerebras" else None
+    return _call_openai_compat(prompt, api_id, mode, key, url, extra)
+
+
+def _call_openai_compat(prompt, model, mode, api_key, url, extra_headers=None):
+    """Endpoint estilo OpenAI /chat/completions (OpenRouter y Cerebras). Un modelo de
+    razonamiento deja content vacio y todo en 'reasoning'; se toma content y si no, reasoning."""
     payload = json.dumps({
         "model": model,
         "temperature": 0.1,
@@ -119,24 +201,51 @@ def call_model(prompt, model, mode, api_key):
             {"role": "user", "content": prompt},
         ],
     }).encode("utf-8")
-    req = urllib.request.Request(
-        API_URL,
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=180) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     if isinstance(data, dict) and data.get("error"):
         raise RuntimeError(f"API devolvio error: {data['error']}")
     try:
-        content = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as e:
-        raise RuntimeError(f"Respuesta inesperada de OpenRouter: {data}") from e
+        msg = data["choices"][0]["message"]
+        content = msg.get("content") or msg.get("reasoning")
+    except (KeyError, IndexError, TypeError, AttributeError) as e:
+        # AttributeError: si 'message' viene null, msg.get() reventaria fuera del except.
+        raise RuntimeError(f"Respuesta inesperada del endpoint: {data}") from e
     if not content or not content.strip():
+        raise RuntimeError("respuesta vacia")
+    return content
+
+
+def _call_gemini(prompt, model, mode, api_key):
+    """Endpoint NATIVO de Gemini (generateContent). El OpenAI-compat de Google esta roto
+    (503/truncado, verificado); el nativo funciona con urllib. La key va en query string.
+    responseMimeType JSON fuerza salida parseable."""
+    url = GEMINI_URL_TMPL.format(model=model) + f"?key={api_key}"
+    payload = json.dumps({
+        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPTS[mode]}]},
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 8000,
+                             "responseMimeType": "application/json"},
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    try:
+        cand = data["candidates"][0]
+    except (KeyError, IndexError, TypeError) as e:
+        raise RuntimeError(f"Respuesta inesperada de Gemini: {data}") from e
+    fr = cand.get("finishReason")
+    if fr not in (None, "STOP", "MAX_TOKENS"):
+        raise RuntimeError(f"Gemini corto la respuesta (finishReason={fr})")
+    # 'content' puede venir null (bloqueo de seguridad sin finishReason): or {} evita AttributeError.
+    parts = (cand.get("content") or {}).get("parts", [])
+    content = "".join(p.get("text", "") for p in parts)
+    if not content.strip():
         raise RuntimeError("respuesta vacia")
     return content
 
@@ -315,14 +424,14 @@ def retry_after_seconds(exc):
     return int(val) if val.isdigit() else None
 
 
-def try_ladder(prompt, models, mode, api_key, exclude):
+def try_ladder(prompt, models, mode, exclude):
     """Primer modelo de la escalera que responda: (model_id, texto). None si todos fallan."""
     for model in models:
         if model in exclude:
             continue
         for attempt in range(1, RETRIES_PER_MODEL + 1):
             try:
-                return model, call_model(prompt, model, mode, api_key)
+                return model, call_model(prompt, model, mode)
             except urllib.error.HTTPError as exc:
                 log(f"{model}: HTTP {exc.code} {exc.reason} (intento {attempt}/{RETRIES_PER_MODEL})")
                 if exc.code == 429:
@@ -399,11 +508,11 @@ def verify_quotes(findings, source):
     return ok, discarded
 
 
-def get_verified_review(prompt, models, mode, api_key, exclude=frozenset()):
+def get_verified_review(prompt, models, mode, exclude=frozenset()):
     """(model, findings_verificados, n_descartados) o None si ningun modelo sirvio."""
     tried = set(exclude)
     while True:
-        result = try_ladder(prompt, models, mode, api_key, exclude=tried)
+        result = try_ladder(prompt, models, mode, exclude=tried)
         if result is None:
             return None
         model, text = result
@@ -413,7 +522,7 @@ def get_verified_review(prompt, models, mode, api_key, exclude=frozenset()):
             try:
                 text2 = call_model(
                     prompt + "\n\nRECUERDA: responde SOLO el objeto JSON especificado, nada mas.",
-                    model, mode, api_key,
+                    model, mode,
                 )
                 findings = parse_findings(text2)
             except Exception as exc:
@@ -441,13 +550,17 @@ def same_finding(a, b):
 
 
 def model_family(model_id):
-    """Familia del modelo para diversificar el consenso: el proveedor (segmento antes del
-    '/'), en minusculas. gpt-oss-120b y gpt-oss-20b comparten proveedor 'openai' (el mismo
-    modelo en grande y mini -> mismos puntos ciegos); qwen3-coder y qwen3-235b comparten
-    'qwen' (misma base Qwen3). NO se usa PREFERRED_FAMILIES: ahi 'coder' es transversal y
-    separaria qwen3-coder de qwen3-235b siendo la misma base. Un consenso real exige DOS
+    """Familia del modelo para diversificar el consenso. Los proveedores dedicados
+    (cerebras/gemini) son cada uno su propia familia; en OpenRouter la familia es el
+    proveedor (segmento antes del '/'), en minusculas. gpt-oss-120b y gpt-oss-20b comparten
+    'openai' (el mismo modelo grande/mini -> mismos puntos ciegos); qwen3-coder y qwen3-235b
+    comparten 'qwen' (misma base). NO se usa PREFERRED_FAMILIES: ahi 'coder' es transversal
+    y separaria qwen3-coder de qwen3-235b siendo la misma base. Un consenso real exige DOS
     familias distintas para que, cuando uno alucine, el otro lo cache de verdad."""
-    return model_id.split("/", 1)[0].strip().lower()
+    provider, api_id, _ = resolve_provider(model_id)
+    if provider != "openrouter":
+        return provider
+    return api_id.split("/", 1)[0].strip().lower()
 
 
 def merge_consensus(fa, fb):
@@ -525,7 +638,18 @@ def main():
 
     # Escalera gratis fresca (cache semanal). En modo 'paid' no hace falta tocar el
     # catalogo, asi que se evita la llamada de red.
-    free_models = FREE_MODELS if args.model == "paid" else load_free_models(api_key)
+    if args.model == "paid":
+        free_models = FREE_MODELS
+    else:
+        # Proveedores con cuota DEDICADA (gemma, gemini) van PRIMERO en la escalera; solo los
+        # que tengan su key en el entorno. Luego la alberca :free de OpenRouter (auto-refrescada).
+        dedicated = []
+        for m in DEDICATED_FREE:
+            if os.environ.get(resolve_provider(m)[2]):
+                dedicated.append(m)
+            else:
+                log(f"omito {m}: falta {resolve_provider(m)[2]} en el entorno")
+        free_models = dedicated + load_free_models(api_key)
     # Saca de la escalera los modelos en cuarentena vigente (fallaron feo hace poco).
     quarantine = _load_quarantine()
     vigentes = [m for m in free_models if not _is_quarantined(m, quarantine)]
@@ -541,7 +665,7 @@ def main():
     }
     ladder = ladders[args.model]
 
-    r1 = get_verified_review(prompt, ladder, args.mode, api_key)
+    r1 = get_verified_review(prompt, ladder, args.mode)
     if r1 is None:
         log("ERROR: ningun modelo de la escalera respondio.")
         sys.exit(1)
@@ -562,7 +686,7 @@ def main():
         otros = ", ".join(sorted(misma_familia - {model1}))
         log(f"consenso: excluyo la familia '{fam1}' del 2do revisor ({otros}) "
             "para no repetir puntos ciegos")
-    r2 = get_verified_review(prompt, ladder, args.mode, api_key, exclude=misma_familia)
+    r2 = get_verified_review(prompt, ladder, args.mode, exclude=misma_familia)
     if r2 is None:
         log("Solo un modelo respondio; consenso degradado a revision simple.")
         for f in f1:

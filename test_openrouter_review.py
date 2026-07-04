@@ -139,6 +139,57 @@ def test_retry_after_none_si_ausente_o_fecha_http():
     print("PASS: test_retry_after_none_si_ausente_o_fecha_http")
 
 
+# --- Multi-proveedor + throttle de RPM (2026-07-04) ---------------------------
+def test_resolve_provider():
+    assert orr.resolve_provider("cerebras:gemma-4-31b") == (
+        "cerebras", "gemma-4-31b", "CEREBRAS_API_KEY")
+    assert orr.resolve_provider("gemini:gemini-flash-latest") == (
+        "gemini", "gemini-flash-latest", "GEMINI_API_KEY")
+    # sin prefijo = OpenRouter; el id se conserva tal cual (incluido el ':free' del final)
+    assert orr.resolve_provider("qwen/qwen3-coder:free") == (
+        "openrouter", "qwen/qwen3-coder:free", "OPENROUTER_API_KEY")
+    assert orr.resolve_provider("deepseek/deepseek-v4-flash") == (
+        "openrouter", "deepseek/deepseek-v4-flash", "OPENROUTER_API_KEY")
+    print("PASS: test_resolve_provider")
+
+
+def test_model_family_dedicados_distintos():
+    # cada proveedor dedicado es su propia familia; en OpenRouter la familia es el
+    # proveedor (antes del '/'), sin que el ':free' del final la contamine.
+    assert orr.model_family("cerebras:gemma-4-31b") == "cerebras"
+    assert orr.model_family("gemini:gemini-flash-latest") == "gemini"
+    assert orr.model_family("qwen/qwen3-coder:free") == "qwen"
+    assert orr.model_family("openai/gpt-oss-120b:free") == "openai"
+    # gemma (Cerebras) y gemini son familias DISTINTAS -> el consenso los cuenta separados
+    assert orr.model_family("cerebras:gemma-4-31b") != orr.model_family("gemini:gemini-flash-latest")
+    print("PASS: test_model_family_dedicados_distintos")
+
+
+def test_throttle_respeta_intervalo():
+    import json as _json
+    import shutil
+    import time as _time
+    d = tempfile.mkdtemp()
+    orig_path = orr.RATELIMIT_PATH
+    orig_int = orr.PROVIDER_MIN_INTERVAL.copy()
+    try:
+        orr.RATELIMIT_PATH = os.path.join(d, "rl.json")
+        # sin estado previo: no espera
+        t0 = _time.time(); orr._throttle("cerebras"); assert _time.time() - t0 < 1.0
+        # ultima llamada = ahora + intervalo corto: debe dormir ~ ese intervalo
+        orr.PROVIDER_MIN_INTERVAL["cerebras"] = 0.5
+        _json.dump({"cerebras": _time.time()}, open(orr.RATELIMIT_PATH, "w"))
+        t0 = _time.time(); orr._throttle("cerebras"); dt = _time.time() - t0
+        assert 0.3 < dt < 1.5, f"esperado ~0.5s, fue {dt:.2f}"
+        # proveedor sin intervalo (openrouter): no throttlea
+        t0 = _time.time(); orr._throttle("openrouter"); assert _time.time() - t0 < 0.3
+        print("PASS: test_throttle_respeta_intervalo")
+    finally:
+        orr.RATELIMIT_PATH = orig_path
+        orr.PROVIDER_MIN_INTERVAL.clear(); orr.PROVIDER_MIN_INTERVAL.update(orig_int)
+        shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]

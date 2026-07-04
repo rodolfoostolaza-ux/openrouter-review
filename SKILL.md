@@ -1,6 +1,6 @@
 ---
 name: openrouter-review
-description: Review code or text using OpenRouter with verified free-model ladder, cheap-paid fallback, and anti-hallucination quote verification. Use as automatic fallback when codex:rescue fails, or as standalone reviewer. After presenting findings, can implement fixes directly with Edit/Write. Works with git diffs and/or text files (notes, docs, .md).
+description: Review code or text using a dedicated-quota model ladder (Cerebras Gemma → Gemini free → OpenRouter :free → cheap paid), with per-provider RPM throttle and anti-hallucination quote verification. Use as automatic fallback when codex:rescue fails, or as standalone reviewer. After presenting findings, can implement fixes directly with Edit/Write. Works with git diffs and/or text files (notes, docs, .md).
 ---
 
 ## Cuándo usar este skill
@@ -12,11 +12,21 @@ description: Review code or text using OpenRouter with verified free-model ladde
 
 `~/.claude/scripts/openrouter_review.py` ya trae la robustez integrada — no hay
 que orquestarla desde el skill:
-- Escalera de modelos gratis AUTO-REFRESCADA desde /api/v1/models (cache semanal,
-  selección heurística por familia-de-código + contexto); `FREE_MODELS` hardcoded
-  queda como semilla y red de seguridad. Retry+backoff inteligente en 429/5xx:
-  respeta `Retry-After` si es corto, si no salta de modelo (los :free suelen tener
-  tope diario, esperar no los desatura).
+- **Escalera multi-proveedor con cuota DEDICADA primero (2026-07-04):** el orden es
+  `cerebras:gemma-4-31b` → `gemini:gemini-flash-latest` → `:free` de OpenRouter →
+  pagado barato. Los dos primeros usan cuota TUYA (no la alberca `:free` compartida
+  de OpenRouter, que da 429 masivo en horas pico sin importar tu saldo) y son rápidos
+  (gemma ~0.7s, gemini ~8s). Verificados como revisores (5/5 bugs sembrados, 0 falsos
+  positivos, respetan foco). Un id con prefijo `cerebras:`/`gemini:` va a su endpoint;
+  sin prefijo = OpenRouter. Se saltan solos si falta su key en el entorno.
+- **Throttle de RPM por proveedor** (`PROVIDER_MIN_INTERVAL`, estado en
+  `openrouter_ratelimit.json`): respeta el rate limit gratis de cada proveedor ENTRE
+  invocaciones (Cerebras 5 req/min → 12s; Gemini ~15 rpm → 4.5s). "No me cobren":
+  quedarse dentro del free tier. Best-effort (no atómico entre procesos paralelos).
+- La parte `:free` de OpenRouter sigue AUTO-REFRESCADA desde /api/v1/models (cache
+  semanal, heurística por familia-de-código + contexto); `FREE_MODELS` queda como
+  semilla. Retry+backoff inteligente en 429/5xx: respeta `Retry-After` si es corto,
+  si no salta de modelo (los :free suelen tener tope diario, esperar no los desatura).
 - Si todos los gratis fallan, cae solo al pagado más barato decente
   (deepseek-v4-flash, ~$0.10/M in — un review típico cuesta centavos) y lo avisa
   en stderr con `AVISO: se uso modelo PAGADO`.
@@ -27,15 +37,19 @@ que orquestarla desde el skill:
 
 ## Pasos
 
-### 1. Verificar API key
+### 1. Verificar API keys
 
 ```bash
-echo $OPENROUTER_API_KEY
+echo "OR=${OPENROUTER_API_KEY:+ok} CB=${CEREBRAS_API_KEY:+ok} GM=${GEMINI_API_KEY:+ok}"
 ```
 
-Si está vacía: "Falta `OPENROUTER_API_KEY`. Debería estar en settings.json —
-reinicia Claude Code o configúrala con `$env:OPENROUTER_API_KEY = 'tu-key'`."
-Y detener.
+- `OPENROUTER_API_KEY` es **requerida** (catálogo `:free` + fallback pagado). Si falta:
+  "Falta `OPENROUTER_API_KEY`. Debería estar en settings.json — reinicia Claude Code."
+  Y detener.
+- `CEREBRAS_API_KEY` y `GEMINI_API_KEY` son **recomendadas** (los dos primeros peldaños
+  con cuota dedicada). Si faltan, el script se degrada solo a la escalera OpenRouter y lo
+  avisa en stderr (`omito cerebras:… / gemini:…`) — funciona, solo pierde velocidad y la
+  cuota propia. Las tres viven en `settings.json` bajo `env`.
 
 ### 2. Determinar el modo de invocación
 
