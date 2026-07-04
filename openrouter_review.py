@@ -127,6 +127,11 @@ def log(msg):
     print(f"[openrouter-review] {msg}", file=sys.stderr)
 
 
+class TruncatedResponse(RuntimeError):
+    """La salida se corto por tope de tokens (input muy grande), no por modelo roto. Se salta
+    de modelo SIN cuarentena: castigar 2h a gemma/gemini por un diff enorme seria injusto."""
+
+
 def resolve_provider(model_id):
     """(provider, api_id, key_env) de un id de la escalera. Prefijo 'cerebras:'/'gemini:'
     -> ese proveedor con su api_id limpio; sin prefijo = OpenRouter (comportamiento
@@ -210,11 +215,14 @@ def _call_openai_compat(prompt, model, mode, api_key, url, extra_headers=None):
     if isinstance(data, dict) and data.get("error"):
         raise RuntimeError(f"API devolvio error: {data['error']}")
     try:
-        msg = data["choices"][0]["message"]
+        choice = data["choices"][0]
+        msg = choice["message"]
         content = msg.get("content") or msg.get("reasoning")
     except (KeyError, IndexError, TypeError, AttributeError) as e:
         # AttributeError: si 'message' viene null, msg.get() reventaria fuera del except.
         raise RuntimeError(f"Respuesta inesperada del endpoint: {data}") from e
+    if choice.get("finish_reason") == "length":
+        raise TruncatedResponse(f"{model}: salida truncada por max_tokens (input muy grande)")
     if not content or not content.strip():
         raise RuntimeError("respuesta vacia")
     return content
@@ -240,7 +248,9 @@ def _call_gemini(prompt, model, mode, api_key):
     except (KeyError, IndexError, TypeError) as e:
         raise RuntimeError(f"Respuesta inesperada de Gemini: {data}") from e
     fr = cand.get("finishReason")
-    if fr not in (None, "STOP", "MAX_TOKENS"):
+    if fr == "MAX_TOKENS":
+        raise TruncatedResponse("gemini: salida truncada por maxOutputTokens (input muy grande)")
+    if fr not in (None, "STOP"):
         raise RuntimeError(f"Gemini corto la respuesta (finishReason={fr})")
     # 'content' puede venir null (bloqueo de seguridad sin finishReason): or {} evita AttributeError.
     parts = (cand.get("content") or {}).get("parts", [])
@@ -452,6 +462,11 @@ def try_ladder(prompt, models, mode, exclude):
                     # NO se castigan: no son culpa del modelo.)
                     quarantine_model(model, f"HTTP {exc.code} {exc.reason}")
                 break  # no retryable o agotado: siguiente modelo
+            except TruncatedResponse as exc:
+                # Input muy grande para este modelo: saltar SIN cuarentena y sin reintentar
+                # (reintentar con el mismo input truncaria igual). No es culpa del modelo.
+                log(f"{exc}; salto de modelo (no lo castigo)")
+                break
             except Exception as exc:
                 log(f"{model}: {exc} (intento {attempt}/{RETRIES_PER_MODEL})")
                 if attempt < RETRIES_PER_MODEL:

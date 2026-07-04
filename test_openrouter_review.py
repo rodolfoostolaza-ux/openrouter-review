@@ -190,6 +190,35 @@ def test_throttle_respeta_intervalo():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_truncado_no_cuarentena_y_salta_de_modelo():
+    """Una respuesta truncada (input muy grande) NO debe cuarentenar el modelo: salta al
+    siguiente sin castigar (blindaje 2026-07-04, evita cuarentenar gemma/gemini por un diff enorme)."""
+    import shutil
+    d = tempfile.mkdtemp()
+    orig_q, orig_l, orig_cm = orr.QUARANTINE_PATH, orr.LOG_PATH, orr.call_model
+    try:
+        orr.QUARANTINE_PATH = os.path.join(d, "q.json")
+        orr.LOG_PATH = os.path.join(d, "q.log")
+        llamados = []
+
+        def fake_call(prompt, model, mode):
+            llamados.append(model)
+            if model == "cerebras:gemma-4-31b":
+                raise orr.TruncatedResponse("truncado por tamano")
+            return '{"findings": []}'
+
+        orr.call_model = fake_call
+        res = orr.try_ladder(
+            "x", ["cerebras:gemma-4-31b", "gemini:gemini-flash-latest"], "review", exclude=set())
+        assert res is not None and res[0] == "gemini:gemini-flash-latest"  # salto al 2do
+        assert llamados == ["cerebras:gemma-4-31b", "gemini:gemini-flash-latest"]  # gemma 1 vez, sin reintento
+        assert "cerebras:gemma-4-31b" not in orr._load_quarantine()  # NO castigado por truncar
+        print("PASS: test_truncado_no_cuarentena_y_salta_de_modelo")
+    finally:
+        orr.QUARANTINE_PATH, orr.LOG_PATH, orr.call_model = orig_q, orig_l, orig_cm
+        shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]

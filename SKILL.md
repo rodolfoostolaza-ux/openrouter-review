@@ -27,6 +27,12 @@ que orquestarla desde el skill:
   semanal, heurística por familia-de-código + contexto); `FREE_MODELS` queda como
   semilla. Retry+backoff inteligente en 429/5xx: respeta `Retry-After` si es corto,
   si no salta de modelo (los :free suelen tener tope diario, esperar no los desatura).
+- **Inputs enormes (diffs de cientos de líneas):** truncan la salida de cualquier
+  modelo y rompen el JSON. El script lo detecta (`finish_reason=length` / `MAX_TOKENS`)
+  y **salta de modelo SIN cuarentenar** (no castiga a gemma/gemini por un diff gigante).
+  Aun así, para un review muy grande conviene **`--model auto`** (un solo modelo) en vez
+  de `consensus`, o **trocear el input**: el consensus con input enorme puede tardar o
+  escalar a los `:free` saturados y colgarse.
 - Si todos los gratis fallan, cae solo al pagado más barato decente
   (deepseek-v4-flash, ~$0.10/M in — un review típico cuesta centavos) y lo avisa
   en stderr con `AVISO: se uso modelo PAGADO`.
