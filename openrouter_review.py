@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import re
+import socket
 import sys
 import time
 import urllib.error
@@ -28,16 +29,18 @@ import urllib.request
 # Si un modelo desaparece del catalogo, la escalera salta al siguiente.
 # Orden: especialista de codigo y MoE agiles primero (en MoE manda la velocidad los params
 # ACTIVOS, no el total); densos lentos abajo o fuera.
+# ACTUALIZADO 2026-09-30: qwen3-coder:free y gpt-oss-120b:free ya no estan en el catalogo;
+# semilla = :free vivos con salida maxima >= MIN_COMPLETION (verificado contra /api/v1/models).
 FREE_MODELS = [
-    "qwen/qwen3-coder:free",                    # 480B MoE (35B act): especialista codigo, agil
-    "openai/gpt-oss-120b:free",                 # 120B MoE (~5B act): alto razonamiento, agil
-    "nvidia/nemotron-3-super-120b-a12b:free",   # 120B MoE (12B act)
-    "nvidia/nemotron-3-ultra-550b-a55b:free",   # 550B MoE (55B act): refuerzo pesado
-    "meta-llama/llama-3.3-70b-instruct:free",   # 70B denso
+    "nvidia/nemotron-3-ultra-550b-a55b:free",   # 550B MoE (55B act), ctx 1M, salida max 65K
+    "nvidia/nemotron-3-super-120b-a12b:free",   # 120B MoE (12B act), ctx 262K, salida max 235K
+    "qwen/qwen3.8-27b:free",                    # 27B, ctx 262K, salida max 235K
+    "nvidia/nemotron-3.5-lightning:free",       # ctx 1M, salida max 65K
+    "google/gemma-4-31b-it:free",               # ctx 262K, salida max 32K
 ]
 PAID_MODELS = [
-    "deepseek/deepseek-v4-flash",   # $0.098/M in, $0.197/M out (2026-06-10), 1M ctx
-    "qwen/qwen3-235b-a22b-2507",    # $0.09/M in, $0.10/M out, 262K ctx
+    "deepseek/deepseek-v4-flash",   # $0.079/M in, $0.157/M out (2026-09-30), 1M ctx, salida max 384K
+    "qwen/qwen3-235b-a22b-2507",    # $0.0875/M in, $0.35/M out (2026-09-30), 262K ctx
 ]
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 RETRIES_PER_MODEL = 2
@@ -54,11 +57,30 @@ CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
 GEMINI_URL_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 # Escalera: primero cuota dedicada rapida (gemma), luego gemini, luego la alberca :free de
 # OpenRouter, y al final el pagado barato (PAID_MODELS). Orden pedido por Rodolfo 2026-07-04.
-DEDICATED_FREE = ["cerebras:gemma-4-31b", "gemini:gemini-flash-latest"]
+# Gemini va PINNEADO, no por alias: el 2026-08-16 `gemini-flash-latest` devolvía 503
+# "experiencing high demand" de forma sistemática (tumbó este mismo peldaño dos veces en
+# un review real) mientras los modelos con versión explícita respondían en 1-3 s con la
+# misma key. El alias reparte contra un pool compartido y saturado. Se listan dos pines:
+# ningún modelo de Google es inmune por sí solo, la redundancia es lo que sostiene.
+# 2026-09-13: se quitó `cerebras:gemma-4-31b`. Cerebras retiró el modelo (404 model_not_found desde
+# el 10-sep) y lo que queda allá (qwen-3.8-27b) gasta saldo prepagado y no está validado como revisor.
+# Decisión de Rodolfo: escalera gratis. El soporte `cerebras:` se deja en resolve_provider por si vuelve.
+DEDICATED_FREE = ["gemini:gemini-3.7-flash", "gemini:gemini-3.6-flash"]
 # RPM: intervalo minimo entre llamadas al MISMO proveedor gratis, respetado ENTRE
 # invocaciones via archivo de estado. Cerebras free = 5 req/min -> 12s; Gemini flash free
 # ~15 rpm -> 4.5s con margen. "No me cobren" (Rodolfo): quedarse dentro del free tier.
 PROVIDER_MIN_INTERVAL = {"cerebras": 12.0, "gemini": 4.5}
+
+# --- Claude con los creditos de API del Max 5x (2026-10-18) -------------------
+# 100 USD/mes que vencen cada ciclo: van ANTES del pagado de OpenRouter (lo reemplazan) pero
+# DESPUES de gemini y los :free, para que el primer revisor siga siendo de otra familia que
+# el autor del codigo (Claude). La key NO vive en el entorno: una ANTHROPIC_API_KEY en Windows
+# haria que Claude Code cobre a la API en vez de la suscripcion (regla de Rodolfo). Se lee de
+# CLAUDE_CREDITS_API_KEY si existe, si no de la seccion "Anthropic Console" del archivo de llaves.
+CLAUDE_CREDITS = ["anthropic:claude-sonnet-5-5", "anthropic:claude-haiku-5-5"]
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_KEYS_FILE = os.path.join(os.path.expanduser("~"), ".claude", "projects",
+                                   "C--Users-chido", "memory", "api_keys_proyectos.md")
 RATELIMIT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "openrouter_ratelimit.json")
 
@@ -81,6 +103,12 @@ QUARANTINE_SOFT_COOLDOWN_SECONDS = 2 * 3600   # JSON malo: suele ser transitorio
                                               # por max_tokens, mala suerte), fuera solo un rato
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "openrouter_review.log")
+# 2026-09-30: los :free son modelos de RAZONAMIENTO y el pensamiento cuenta contra max_tokens.
+# Con 8000 fijos, un input de ~40 KB agotaba el tope pensando (finish_reason=length) y el JSON
+# nunca salia. Se sube el tope y se exige a los :free una salida maxima que lo soporte (si no,
+# OpenRouter rechazaria con 400 y el modelo caeria en cuarentena injustamente).
+MAX_OUT_TOKENS = 30000       # tope de salida pedido a OpenRouter
+MIN_COMPLETION = 30000       # un :free con top_provider.max_completion_tokens menor se excluye
 MIN_CONTEXT = 32000          # un revisor con < 32K de contexto no sirve para diffs reales
 MAX_FREE_LADDER = 10         # cuantos modelos gratis conservar en la escalera
 RETRY_AFTER_MAX = 30         # si el 429 pide esperar mas que esto, saltar de modelo
@@ -140,7 +168,25 @@ def resolve_provider(model_id):
         return "cerebras", model_id.split(":", 1)[1], "CEREBRAS_API_KEY"
     if model_id.startswith("gemini:"):
         return "gemini", model_id.split(":", 1)[1], "GEMINI_API_KEY"
+    if model_id.startswith("anthropic:"):
+        return "anthropic", model_id.split(":", 1)[1], "CLAUDE_CREDITS_API_KEY"
     return "openrouter", model_id, "OPENROUTER_API_KEY"
+
+
+def anthropic_key(path=ANTHROPIC_KEYS_FILE):
+    """Key de los creditos de API: env CLAUDE_CREDITS_API_KEY o, si no, la primera `sk-ant-...`
+    bajo el encabezado '## Anthropic Console' del archivo de llaves. None si no hay."""
+    key = os.environ.get("CLAUDE_CREDITS_API_KEY")
+    if key:
+        return key
+    try:
+        with open(path, encoding="utf-8") as fh:
+            texto = fh.read()
+    except OSError:
+        return None
+    seccion = re.search(r"^## Anthropic Console.*?(?=^## |\Z)", texto, re.S | re.M)
+    m = seccion and re.search(r"sk-ant-[A-Za-z0-9_-]{20,}", seccion.group(0))
+    return m.group(0) if m else None
 
 
 def _throttle(provider):
@@ -182,25 +228,29 @@ def call_model(prompt, model, mode):
     """Despacha la llamada al proveedor que corresponda al id del modelo. La key se lee del
     entorno (nunca se hardcodea: este script es publico). Respeta el RPM del proveedor."""
     provider, api_id, key_env = resolve_provider(model)
-    key = os.environ.get(key_env)
+    key = anthropic_key() if provider == "anthropic" else os.environ.get(key_env)
     if not key:
-        raise RuntimeError(f"falta {key_env} en el entorno para {model}")
+        donde = "entorno ni archivo de llaves" if provider == "anthropic" else "entorno"
+        raise RuntimeError(f"falta {key_env} ({donde}) para {model}")
     _throttle(provider)
     if provider == "gemini":
         return _call_gemini(prompt, api_id, mode, key)
+    if provider == "anthropic":
+        return _call_anthropic(prompt, api_id, mode, key)
     url = CEREBRAS_URL if provider == "cerebras" else API_URL
     # Cerebras esta detras de Cloudflare y banea el User-Agent de urllib con 403 code 1010.
     extra = {"User-Agent": "Mozilla/5.0"} if provider == "cerebras" else None
-    return _call_openai_compat(prompt, api_id, mode, key, url, extra)
+    return _call_openai_compat(prompt, api_id, mode, key, url, extra,
+                               max_tokens=MAX_OUT_TOKENS if provider == "openrouter" else 8000)
 
 
-def _call_openai_compat(prompt, model, mode, api_key, url, extra_headers=None):
+def _call_openai_compat(prompt, model, mode, api_key, url, extra_headers=None, max_tokens=8000):
     """Endpoint estilo OpenAI /chat/completions (OpenRouter y Cerebras). Un modelo de
     razonamiento deja content vacio y todo en 'reasoning'; se toma content y si no, reasoning."""
     payload = json.dumps({
         "model": model,
         "temperature": 0.1,
-        "max_tokens": 8000,
+        "max_tokens": max_tokens,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPTS[mode]},
             {"role": "user", "content": prompt},
@@ -228,15 +278,100 @@ def _call_openai_compat(prompt, model, mode, api_key, url, extra_headers=None):
     return content
 
 
+def _call_anthropic(prompt, model, mode, api_key):
+    """Messages API de Anthropic, stdlib. Sin temperature: Sonnet/Haiku 5.5 dan 400 con valores
+    no default. El thinking adaptativo viene encendido; se toman solo los bloques 'text'."""
+    payload = json.dumps({
+        "model": model,
+        "max_tokens": 16000,
+        "system": SYSTEM_PROMPTS[mode],
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode("utf-8")
+    headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01",
+               "content-type": "application/json"}
+    req = urllib.request.Request(ANTHROPIC_URL, data=payload, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    stop = data.get("stop_reason")
+    if stop == "max_tokens":
+        raise TruncatedResponse(f"{model}: salida truncada por max_tokens (input muy grande)")
+    if stop == "refusal":
+        raise RuntimeError(f"{model}: rechazo ({data.get('stop_details')})")
+    content = "".join(b.get("text", "") for b in data.get("content") or []
+                      if isinstance(b, dict) and b.get("type") == "text")
+    if not content.strip():
+        raise RuntimeError("respuesta vacia")
+    return content
+
+
+GEMINI_HOST = "generativelanguage.googleapis.com"
+# Hosts de Google que comparten frontend con la API de Gemini; si su IP responde, sirve de desvio.
+GEMINI_ALT_HOSTS = ("oauth2.googleapis.com", "aiplatform.googleapis.com")
+_gemini_ruta_lista = False
+_gemini_sin_ruta = False          # True si ni el host ni las IPs alternas responden: saltar Gemini
+GEMINI_PRUEBA_TOPE_S = 10         # tope total para la prueba de ruta (review de Codex, 30-sep-2026)
+
+
+def _tcp_ok(ip, timeout=3):
+    try:
+        with socket.create_connection((ip, 443), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _asegurar_ruta_gemini():
+    """Desde la red de la casa, el bloque de IPs de Google al que resuelve la API de Gemini
+    (172.217.112-119.x) da timeout de conexion (diagnostico 30-sep-2026; ver memoria
+    feedback_gemini_red_bloqueo). Si el host no responde en 3 s, se busca una IP de Google que
+    si responda y se desvia SOLO ese host con getaddrinfo: SNI y certificado siguen usando el
+    nombre original, asi que TLS se verifica igual. Una vez por proceso."""
+    global _gemini_ruta_lista, _gemini_sin_ruta
+    if _gemini_ruta_lista:
+        return
+    _gemini_ruta_lista = True
+    limite = time.monotonic() + GEMINI_PRUEBA_TOPE_S
+    try:
+        ips = {a[4][0] for a in socket.getaddrinfo(GEMINI_HOST, 443, socket.AF_INET)}
+    except OSError:
+        ips = set()
+    if any(_tcp_ok(ip) for ip in sorted(ips)[:2]):
+        return
+    for alt in GEMINI_ALT_HOSTS:
+        try:
+            cand = [a[4][0] for a in socket.getaddrinfo(alt, 443, socket.AF_INET)][:2]
+        except OSError:
+            continue
+        for ip in cand:
+            if time.monotonic() > limite:
+                break
+            if ip not in ips and _tcp_ok(ip):
+                original = socket.getaddrinfo
+
+                def _gai(host, *args, _ip=ip, _orig=original, **kw):
+                    return _orig(_ip if host == GEMINI_HOST else host, *args, **kw)
+
+                socket.getaddrinfo = _gai
+                print(f"[openrouter-review] {GEMINI_HOST} no responde desde esta red; "
+                      f"desvio via {ip} (IP de {alt})", file=sys.stderr)
+                return
+    _gemini_sin_ruta = True
+    print(f"[openrouter-review] {GEMINI_HOST} no responde y no hay IP alterna; salto Gemini",
+          file=sys.stderr)
+
+
 def _call_gemini(prompt, model, mode, api_key):
     """Endpoint NATIVO de Gemini (generateContent). El OpenAI-compat de Google esta roto
     (503/truncado, verificado); el nativo funciona con urllib. La key va en query string.
     responseMimeType JSON fuerza salida parseable."""
+    _asegurar_ruta_gemini()
+    if _gemini_sin_ruta:
+        raise RuntimeError(f"{GEMINI_HOST} sin ruta desde esta red")
     url = GEMINI_URL_TMPL.format(model=model) + f"?key={api_key}"
     payload = json.dumps({
         "systemInstruction": {"parts": [{"text": SYSTEM_PROMPTS[mode]}]},
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 8000,
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 30000,
                              "responseMimeType": "application/json"},
     }).encode("utf-8")
     req = urllib.request.Request(
@@ -327,6 +462,12 @@ def rank_free_models(catalog):
         if ctx < MIN_CONTEXT:
             continue
         if any(marker in full for marker in EXCLUDE_MARKERS):
+            continue
+        try:
+            maxc = int((m.get("top_provider") or {}).get("max_completion_tokens") or 0)
+        except (TypeError, ValueError):
+            maxc = 0
+        if maxc and maxc < MIN_COMPLETION:   # salida corta: truncaria el JSON (None = desconocido, se deja pasar)
             continue
         rank = next((i for i, fam in enumerate(PREFERRED_FAMILIES) if fam in low), None)
         if rank is None:        # familia desconocida: no es un revisor de codigo confiable
@@ -672,11 +813,17 @@ def main():
         fuera = [m for m in free_models if m not in vigentes]
         log(f"en cuarentena (omitidos de la escalera): {', '.join(fuera)}")
     free_models = vigentes or free_models  # si TODO quedo en cuarentena, intentarlos igual
+    # Claude con creditos prepagados del Max: escalon antes del pagado de OpenRouter.
+    claude = []
+    if anthropic_key():
+        claude = [m for m in CLAUDE_CREDITS if not _is_quarantined(m, quarantine)]
+    else:
+        log("omito Claude: no hay key de creditos (CLAUDE_CREDITS_API_KEY ni archivo de llaves)")
     ladders = {
         "free": free_models,
-        "paid": PAID_MODELS,
-        "auto": free_models + PAID_MODELS,
-        "consensus": free_models + PAID_MODELS,
+        "paid": claude + PAID_MODELS,
+        "auto": free_models + claude + PAID_MODELS,
+        "consensus": free_models + claude + PAID_MODELS,
     }
     ladder = ladders[args.model]
 
